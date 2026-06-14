@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use memmap2::Mmap;
 use serde_json::Value;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use crate::container::*;
 use crate::error::{McRawError, Result, read_le_bytes};
@@ -115,6 +116,32 @@ impl Decoder {
         &self.metadata
     }
 
+    /// Hint the OS to prefetch a frame's compressed bytes into the page cache.
+    ///
+    /// Uses `madvise(MADV_WILLNEED)` on Unix to bring the frame's mmap range
+    /// into the page cache ahead of the actual read. Platform-specific
+    /// implementation — this is a no-op on non-Unix targets.
+    #[cfg(unix)]
+    pub fn prefetch(&self, timestamp: i64) {
+        if let Some(bo) = self.frame_map.get(&timestamp) {
+            let start = bo.offset.max(0) as usize;
+            let end = (start + 4 * 1024 * 1024).min(self.mmap.len());
+            if end > start {
+                unsafe {
+                    libc::madvise(
+                        self.mmap.as_ptr().add(start) as *mut _,
+                        end - start,
+                        libc::MADV_WILLNEED,
+                    );
+                }
+            }
+        }
+    }
+
+    /// No-op on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn prefetch(&self, _timestamp: i64) {}
+
     /// Returns an iterator over all frame timestamps in the container.
     pub fn frame_timestamps(&self) -> impl Iterator<Item = i64> + '_ {
         self.frame_offsets.iter().map(|b| b.timestamp)
@@ -169,6 +196,40 @@ impl Decoder {
             other => return Err(McRawError::InvalidCompressionType(other as i32)),
         }
         Ok((output, metadata))
+    }
+
+    /// Decode a single frame by timestamp into a caller-owned buffer.
+    ///
+    /// Avoids the per-frame allocation that `load_frame` does. Returns
+    /// only `asShotNeutral` as `[f32; 3]` — if you need other metadata
+    /// fields, use `load_frame` instead.
+    pub fn load_frame_into(&self, timestamp: i64, out: &mut [u16]) -> Result<[f32; 3]> {
+        let offset = self.frame_map.get(&timestamp).ok_or(McRawError::FrameNotFound(timestamp))?.offset as usize;
+        let data = &self.mmap[..];
+        let mut cur = offset;
+        let buf_item = parse_item(data.get(cur..).ok_or(McRawError::TruncatedData)?)?;
+        cur += 8;
+        let compressed = data.get(cur..cur + buf_item.size as usize).ok_or(McRawError::TruncatedData)?;
+        cur += buf_item.size as usize;
+        let meta_item = parse_item(data.get(cur..).ok_or(McRawError::TruncatedData)?)?;
+        cur += 8;
+        let json_bytes = data.get(cur..cur + meta_item.size as usize).ok_or(McRawError::TruncatedData)?;
+        let light: FrameMetaLight = serde_json::from_slice(json_bytes)
+            .map_err(|e| McRawError::DecompressionFailed(format!("light meta: {}", e)))?;
+        let width = light.width.ok_or_else(|| McRawError::DecompressionFailed("missing width".into()))? as usize;
+        let height = light.height.ok_or_else(|| McRawError::DecompressionFailed("missing height".into()))? as usize;
+        let comp_type = light.compression_type.unwrap_or(7);
+        let pixel_count = width * height;
+        if out.len() < pixel_count {
+            return Err(McRawError::TruncatedData);
+        }
+        match comp_type {
+            7 => { raw::decode(&mut out[..pixel_count], width, height, compressed)?; }
+            6 => { raw_legacy::decode_legacy(&mut out[..pixel_count], width, height, compressed)?; }
+            other => return Err(McRawError::InvalidCompressionType(other as i32)),
+        }
+        let asn = light.as_shot_neutral.unwrap_or([1.0, 1.0, 1.0]);
+        Ok([asn[0] as f32, asn[1] as f32, asn[2] as f32])
     }
 
     /// Decode all frames in parallel using rayon.
@@ -252,4 +313,18 @@ fn parse_audio_index(data: &[u8]) -> Result<AudioIndex> {
         num_offsets: i64::from_le_bytes(read_le_bytes(data, 0)?),
         start_timestamp_ms: i64::from_le_bytes(read_le_bytes(data, 8)?),
     })
+}
+
+/// Minimal per-frame metadata for the fast export path.
+///
+/// Used by `load_frame_into` to avoid parsing the full JSON Value tree.
+/// All fields are `Option` so older files that lack a key don't error.
+#[derive(serde::Deserialize)]
+struct FrameMetaLight {
+    width: Option<u64>,
+    height: Option<u64>,
+    #[serde(rename = "compressionType")]
+    compression_type: Option<i64>,
+    #[serde(rename = "asShotNeutral")]
+    as_shot_neutral: Option<[f64; 3]>,
 }
