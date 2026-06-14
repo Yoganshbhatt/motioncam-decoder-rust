@@ -3,6 +3,8 @@ name = "motioncam-decoder"
 version = "0.1.0"
 edition = "2021"
 description = "Pure-Rust decoder for MotionCam RAW files"
+license = "Apache-2.0"
+repository = "https://github.com/Yoganshbhatt/motioncam-decoder-rust"
 
 [features]
 default = ["parallel"]
